@@ -30,6 +30,7 @@ _started_at = datetime.now(timezone.utc)
 _startup_notice_sent = False
 _scanner_task = None
 _scanner_seen = set()
+_x_credits_depleted = False
 _source_health = {
     "DEX Screener": "active",
     "Solana Tracker": "configured; awaiting first check" if SOLANA_TRACKER_API_KEY else "not configured",
@@ -513,6 +514,7 @@ async def solana_tracker_enrichment(session: aiohttp.ClientSession, contract: st
 
 
 async def x_social_enrichment(session: aiohttp.ClientSession, symbol: str, contract: str) -> dict:
+    global _x_credits_depleted
     result = {
         "status": "not configured",
         "mentions": None,
@@ -521,6 +523,9 @@ async def x_social_enrichment(session: aiohttp.ClientSession, symbol: str, contr
         "momentum": "Unavailable",
     }
     if not X_BEARER_TOKEN:
+        return result
+    if _x_credits_depleted:
+        result["status"] = "credits depleted"
         return result
     clean_symbol = re.sub(r"[^A-Za-z0-9_]", "", symbol)[:20]
     terms = [f'"{contract}"']
@@ -560,9 +565,15 @@ async def x_social_enrichment(session: aiohttp.ClientSession, symbol: str, contr
         _source_health["X/Twitter"] = "active"
     except Exception as exc:
         log.warning("X enrichment failed for %s: %s", contract, exc)
-        result["status"] = "temporarily unavailable"
-        _source_health["X/Twitter"] = "temporarily unavailable"
-        await notify_source_failure("X/Twitter", str(exc))
+        if "HTTP 402" in str(exc) or "credits depleted" in str(exc).lower():
+            _x_credits_depleted = True
+            result["status"] = "credits depleted"
+            _source_health["X/Twitter"] = "credits depleted — add X API credits, then restart"
+            await notify_source_failure("X/Twitter", "API credits depleted; X checks are paused until credits are added and the bot restarts")
+        else:
+            result["status"] = "temporarily unavailable"
+            _source_health["X/Twitter"] = "temporarily unavailable"
+            await notify_source_failure("X/Twitter", str(exc))
     return result
 
 
