@@ -728,6 +728,86 @@ async def setup_onboarding(interaction: discord.Interaction):
     await interaction.followup.send("Gatekeeper and alert preferences installed.", ephemeral=True)
 
 
+@tree.command(name="publish_rules", description="Publish official YRD Alpha rules and risk information.", guild=GUILD)
+async def publish_rules(interaction: discord.Interaction):
+    if not is_reviewer(interaction):
+        await interaction.response.send_message("Only Yurman or an Admin can publish official server information.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    welcome = await find_text_channel("welcome")
+    rules = await find_text_channel("rules")
+    risk_channel = await find_text_channel("risk-disclaimer")
+    how_it_works = await find_text_channel("how-yrd-alpha-works")
+    missing = [name for name, channel in [("welcome", welcome), ("rules", rules), ("risk-disclaimer", risk_channel), ("how-yrd-alpha-works", how_it_works)] if channel is None]
+    if missing:
+        await interaction.followup.send("Missing channel(s): " + ", ".join(missing), ephemeral=True)
+        return
+
+    welcome_embed = discord.Embed(
+        title="WELCOME TO YRD ALPHA",
+        description=(
+            "YRD Alpha is Yurman's meme-coin research, education, risk-management, community, and market-monitoring server.\n\n"
+            "Scout may publish possible setups before Yurman reviews them. An alert is research—not permission to buy, a promise of profit, or a guarantee.\n\n"
+            "Start with #rules, #risk-disclaimer, and #verification."
+        ),
+        color=discord.Color.blue(),
+    )
+    welcome_embed.set_footer(text=DISCLAIMER)
+
+    rules_embed = discord.Embed(
+        title="YRD ALPHA — OFFICIAL SERVER RULES",
+        description=(
+            "**1. No scams or phishing.** No wallet drainers, malicious links, fake airdrops, fake presales, or requests for seed phrases/private keys.\n\n"
+            "**2. No pump coordination or manipulation.** Do not organize coordinated buying, dumping, wash trading, or deceptive promotion.\n\n"
+            "**3. No guaranteed-profit claims.** Do not claim any token, setup, trader, or strategy is guaranteed or risk-free.\n\n"
+            "**4. No fake evidence.** Fake P&L screenshots, fabricated transactions, misleading edits, and false research are prohibited.\n\n"
+            "**5. No impersonation.** Do not impersonate Yurman, staff, support, projects, influencers, or other members.\n\n"
+            "**6. No harassment or harmful content.** No threats, hate, targeted harassment, doxxing, or NSFW content.\n\n"
+            "**7. No spam.** No flooding, duplicate messages, mass mentions, unsolicited advertising, or repeated token requests. Cooldowns may apply.\n\n"
+            "**8. Disclose conflicts.** If you hold, promote, work for, or were paid by a project, say so clearly.\n\n"
+            "**9. Respect moderation.** Escalation may be Warning → Timeout → Restricted → Ban. Serious scams/phishing may receive an immediate ban.\n\n"
+            "**10. Keep results honest.** Wins and losses remain visible. Staff will not delete losing reviewed setups to create a false record."
+        ),
+        color=discord.Color.red(),
+    )
+    rules_embed.set_footer(text="Using YRD Alpha means agreeing to these rules.")
+
+    risk_embed = discord.Embed(
+        title="MEME-COIN RISK DISCLOSURE",
+        description=(
+            "Meme coins are extremely volatile and speculative. You can lose your entire position, sometimes in seconds.\n\n"
+            "Liquidity may disappear; selling can cause severe slippage or may become impossible. Contracts may contain malicious permissions, transfer restrictions, mint/freeze authority, hidden taxes, or honeypot-like behavior. Developers and large holders may sell without warning. Social activity, whale activity, volume, and Scout confidence do not guarantee price appreciation.\n\n"
+            "YRD Alpha, Scout alerts, Yurman's reviews, community posts, paper trading, calculators, and educational material are research tools—not personalized financial advice or automatic trade instructions.\n\n"
+            "Only risk money you can afford to lose. Verify contracts independently, decide the maximum loss before entry, and protect wallet credentials. Past results do not guarantee future results."
+        ),
+        color=discord.Color.orange(),
+    )
+    risk_embed.set_footer(text="Never share your seed phrase or private key. YRD Alpha staff will never ask for them.")
+
+    workflow_embed = discord.Embed(
+        title="HOW YRD ALPHA WORKS",
+        description=(
+            "**1. Token detected or submitted**\n"
+            "**2. Scout analyzes available market, wallet, contract, and social signals**\n"
+            "**3. Public Scout alert may appear as NOT REVIEWED**\n"
+            "**4. Candidate enters the private Yurman review queue**\n"
+            "**5. Yurman/Admin selects APPROVE, WATCH, REJECT, HIGH RISK, or RUG WARNING**\n"
+            "**6. Monitoring and risk alerts continue when data is available**\n"
+            "**7. The journal keeps the result—win or loss**\n"
+            "**8. After-action education explains what happened**\n\n"
+            "No stage promises profit. Missing or unavailable data must be stated openly."
+        ),
+        color=discord.Color.green(),
+    )
+    workflow_embed.set_footer(text=DISCLAIMER)
+
+    await welcome.send(embed=welcome_embed, allowed_mentions=discord.AllowedMentions.none())
+    await rules.send(embed=rules_embed, allowed_mentions=discord.AllowedMentions.none())
+    await risk_channel.send(embed=risk_embed, allowed_mentions=discord.AllowedMentions.none())
+    await how_it_works.send(embed=workflow_embed, allowed_mentions=discord.AllowedMentions.none())
+    await interaction.followup.send("Official welcome, rules, risk disclosure, and workflow published.", ephemeral=True)
+
+
 async def main():
     async with client:
         await client.start(TOKEN)
