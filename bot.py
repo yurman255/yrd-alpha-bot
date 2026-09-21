@@ -1,8 +1,10 @@
 import asyncio
 import logging
 import os
-from datetime import datetime, timezone
+import re
+from datetime import datetime, timedelta, timezone
 
+import aiohttp
 import discord
 from discord import app_commands
 
@@ -24,9 +26,13 @@ client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 _started_at = datetime.now(timezone.utc)
 _startup_notice_sent = False
+_scanner_task = None
+_scanner_seen = set()
 
 DISCLAIMER = "Research only. Not financial advice or a guaranteed return. Meme coins can lose their entire value."
 REVIEW_ROLES = {"Yurman / Owner", "Admin"}
+MODERATOR_ROLES = {"Yurman / Owner", "Admin", "Moderator"}
+SUPPORT_ROLES = {"Yurman / Owner", "Admin", "Moderator", "Support"}
 ALERT_ROLES = [
     ("🚀 New Launches", "New Launches", discord.ButtonStyle.primary),
     ("✅ Yurman Reviewed", "Yurman Reviewed", discord.ButtonStyle.success),
@@ -48,6 +54,25 @@ def is_reviewer(interaction: discord.Interaction) -> bool:
     if interaction.user.id == interaction.guild.owner_id:
         return True
     return any(role.name in REVIEW_ROLES for role in getattr(interaction.user, "roles", []))
+
+
+def has_named_role(interaction: discord.Interaction, allowed: set[str]) -> bool:
+    if not interaction.guild:
+        return False
+    if interaction.user.id == interaction.guild.owner_id:
+        return True
+    return any(role.name in allowed for role in getattr(interaction.user, "roles", []))
+
+
+async def audit_action(action: str, actor, target: str, details: str):
+    channel = await find_text_channel("mod-log")
+    if channel is None:
+        return
+    embed = discord.Embed(title=f"AUDIT — {action}", color=discord.Color.dark_blue(), timestamp=datetime.now(timezone.utc))
+    embed.add_field(name="Actor", value=f"{actor} (`{getattr(actor, 'id', 'unknown')}`)", inline=False)
+    embed.add_field(name="Target", value=target, inline=False)
+    embed.add_field(name="Details", value=details[:1000] or "None", inline=False)
+    await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
 
 
 async def find_text_channel(name: str):
@@ -344,6 +369,158 @@ async def candidate_exists(contract: str) -> bool:
     return False
 
 
+def money_text(value) -> str:
+    try:
+        number = float(value or 0)
+    except (TypeError, ValueError):
+        return "Unavailable"
+    if number >= 1_000_000_000:
+        return f"${number / 1_000_000_000:.2f}B"
+    if number >= 1_000_000:
+        return f"${number / 1_000_000:.2f}M"
+    if number >= 1_000:
+        return f"${number / 1_000:.1f}K"
+    return f"${number:,.2f}"
+
+
+async def publish_live_candidate(pair: dict, engine: str, score: int):
+    base = pair.get("baseToken") or {}
+    contract = str(base.get("address") or "").strip()
+    if not contract or contract in _scanner_seen or await candidate_exists(contract):
+        return False
+    alpha = await find_text_channel("alpha-scout")
+    waiting = await find_text_channel("waiting-for-yurman")
+    review = await find_text_channel("scout-review")
+    if not all((alpha, waiting, review)):
+        return False
+    symbol = str(base.get("symbol") or "UNKNOWN").upper()[:20]
+    liquidity = float(((pair.get("liquidity") or {}).get("usd")) or 0)
+    market_cap = float(pair.get("marketCap") or pair.get("fdv") or 0)
+    volume_h24 = float(((pair.get("volume") or {}).get("h24")) or 0)
+    h1 = ((pair.get("txns") or {}).get("h1")) or {}
+    buys, sells = int(h1.get("buys") or 0), int(h1.get("sells") or 0)
+    created_ms = pair.get("pairCreatedAt")
+    age_minutes = max(0, int((datetime.now(timezone.utc).timestamp() * 1000 - created_ms) / 60000)) if isinstance(created_ms, (int, float)) else None
+    confidence = "HIGH" if score >= 85 else "MEDIUM"
+    risk = "HIGH" if liquidity < 100_000 or sells > buys * 1.4 else "MEDIUM"
+    embed = discord.Embed(
+        title=f"🔎 YRD ALPHA SCOUT — POSSIBLE SETUP: ${symbol}",
+        description=(
+            f"**Engine:** {engine}\n"
+            "DEX market activity passed the current screening threshold.\n\n"
+            "⚠️ **Yurman has NOT reviewed this setup yet.**\n"
+            "Wallet clustering, holder concentration, contract permissions, and X sentiment are not yet connected. Investigate before acting."
+        ),
+        color=discord.Color.gold(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    for name, value, inline in [
+        ("Token", f"${symbol}", True), ("Market Cap", money_text(market_cap), True),
+        ("Liquidity", money_text(liquidity), True), ("Volume", money_text(volume_h24) + " / 24h", True),
+        ("Age", f"{age_minutes} minutes" if age_minutes is not None else "Unavailable", True),
+        ("Buyers / Sellers", f"{buys} / {sells} (1h)", True), ("Risk", risk, True),
+        ("Confidence", confidence, True), ("Signal Score", f"{score}/100", True),
+        ("Contract", contract, False), ("Source Coverage", "DEX Screener official public API. Contract, wallet, and X checks unavailable.", False),
+    ]:
+        embed.add_field(name=name, value=value, inline=inline)
+    url = pair.get("url")
+    if url:
+        embed.add_field(name="Research Link", value=str(url), inline=False)
+    embed.set_footer(text=DISCLAIMER)
+    public_message = await alpha.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+    waiting_embed = embed.copy()
+    waiting_embed.title = f"⏳ WAITING FOR YURMAN — ${symbol}"
+    waiting_embed.description = f"Live DEX candidate awaiting private review.\n[Open public Scout alert]({public_message.jump_url})\n\n{DISCLAIMER}"
+    waiting_message = await waiting.send(embed=waiting_embed, allowed_mentions=discord.AllowedMentions.none())
+    review_embed = embed.copy()
+    review_embed.title = f"PRIVATE LIVE SCOUT REVIEW — ${symbol}"
+    review_embed.description = "Choose one decision below. Only Yurman or an Admin can use these buttons."
+    review_embed.add_field(name="Public Alert", value=public_message.jump_url, inline=False)
+    review_embed.add_field(name="Waiting Card", value=waiting_message.jump_url, inline=False)
+    await review.send(embed=review_embed, view=ReviewView(), allowed_mentions=discord.AllowedMentions.none())
+    _scanner_seen.add(contract)
+    return True
+
+
+def score_pair(pair: dict) -> int:
+    liquidity = float(((pair.get("liquidity") or {}).get("usd")) or 0)
+    volume = float(((pair.get("volume") or {}).get("h24")) or 0)
+    h1 = ((pair.get("txns") or {}).get("h1")) or {}
+    buys, sells = int(h1.get("buys") or 0), int(h1.get("sells") or 0)
+    change_h1 = float(((pair.get("priceChange") or {}).get("h1")) or 0)
+    score = 0
+    score += 25 if liquidity >= 100_000 else 18 if liquidity >= 50_000 else 10 if liquidity >= 25_000 else 0
+    score += 25 if volume >= 500_000 else 18 if volume >= 150_000 else 10 if volume >= 50_000 else 0
+    score += 20 if buys + sells >= 250 else 14 if buys + sells >= 80 else 8 if buys + sells >= 30 else 0
+    score += 15 if buys >= max(1, sells) * 1.25 else 8 if buys >= sells else 0
+    score += 10 if 3 <= change_h1 <= 80 else 4 if change_h1 > 0 else 0
+    if liquidity and volume / liquidity >= 1:
+        score += 5
+    return min(score, 100)
+
+
+async def dex_scanner_loop():
+    await client.wait_until_ready()
+    timeout = aiohttp.ClientTimeout(total=20)
+    while not client.is_closed():
+        try:
+            async with aiohttp.ClientSession(timeout=timeout, headers={"User-Agent": "YRD-Alpha-Scout/1.0"}) as session:
+                sources = [
+                    ("NEW PROFILE SCANNER", "https://api.dexscreener.com/token-profiles/latest/v1"),
+                    ("MOMENTUM SCANNER", "https://api.dexscreener.com/token-boosts/top/v1"),
+                ]
+                candidates = []
+                for engine, endpoint in sources:
+                    async with session.get(endpoint) as response:
+                        if response.status != 200:
+                            log.warning("DEX source %s returned HTTP %s", endpoint, response.status)
+                            continue
+                        profiles = await response.json()
+                    if not isinstance(profiles, list):
+                        continue
+                    addresses = []
+                    for profile in profiles:
+                        if profile.get("chainId") == "solana" and profile.get("tokenAddress"):
+                            addresses.append(profile["tokenAddress"])
+                        if len(addresses) >= 20:
+                            break
+                    if not addresses:
+                        continue
+                    token_url = "https://api.dexscreener.com/tokens/v1/solana/" + ",".join(addresses)
+                    async with session.get(token_url) as response:
+                        if response.status != 200:
+                            log.warning("DEX token lookup returned HTTP %s", response.status)
+                            continue
+                        pairs = await response.json()
+                    best_by_token = {}
+                    for pair in pairs if isinstance(pairs, list) else []:
+                        address = str(((pair.get("baseToken") or {}).get("address")) or "")
+                        liquidity = float(((pair.get("liquidity") or {}).get("usd")) or 0)
+                        if address and (address not in best_by_token or liquidity > float(((best_by_token[address].get("liquidity") or {}).get("usd")) or 0)):
+                            best_by_token[address] = pair
+                    for pair in best_by_token.values():
+                        score = score_pair(pair)
+                        if score >= 60:
+                            candidates.append((score, engine, pair))
+                posted = 0
+                for score, engine, pair in sorted(candidates, key=lambda item: item[0], reverse=True):
+                    if await publish_live_candidate(pair, engine, score):
+                        posted += 1
+                    if posted >= 2:
+                        break
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("DEX scanner cycle failed")
+            status_channel = await find_text_channel("bot-status")
+            if status_channel:
+                try:
+                    await status_channel.send("⚠️ YRD Alpha Scout data source DEX Screener is temporarily unavailable. Data coverage is incomplete.")
+                except discord.DiscordException:
+                    pass
+        await asyncio.sleep(300)
+
+
 async def publish_candidate(
     interaction: discord.Interaction,
     token: str,
@@ -414,7 +591,8 @@ async def post_startup_notice_once():
             "🟢 **YRD Alpha Scout is ONLINE**\n"
             f"Connected: `{utc_now_text()}`\n"
             "Phase 2 review workflow: **active**.\n"
-            "Live market data providers: **not connected yet**.",
+            "DEX Screener public scanner: **active**.\n"
+            "Wallet, contract, Axiom, FOMO, Trenchers, and X providers: **not connected yet**.",
             allowed_mentions=discord.AllowedMentions.none(),
         )
         _startup_notice_sent = True
@@ -424,6 +602,7 @@ async def post_startup_notice_once():
 
 @client.event
 async def on_ready():
+    global _scanner_task
     log.info("Logged in as %s (%s)", client.user, client.user.id if client.user else "unknown")
     guild = client.get_guild(GUILD_ID)
     if guild is None:
@@ -439,6 +618,8 @@ async def on_ready():
         log.exception("Slash command sync failed")
     await client.change_presence(status=discord.Status.online, activity=discord.Activity(type=discord.ActivityType.watching, name="YRD Alpha"))
     await post_startup_notice_once()
+    if _scanner_task is None or _scanner_task.done():
+        _scanner_task = asyncio.create_task(dex_scanner_loop())
 
 
 @tree.command(name="status", description="Check whether YRD Alpha Scout is online.", guild=GUILD)
@@ -451,7 +632,8 @@ async def status(interaction: discord.Interaction):
         "🟢 **YRD Alpha Scout is online**\n"
         f"Latency: `{round(client.latency * 1000)} ms`\n"
         f"Uptime: `{hours}h {minutes}m {secs}s`\n"
-        "Review workflow: `active`\nLive scanner: `awaiting data provider`",
+        "Review workflow: `active`\nDEX scanner: `active`\n"
+        "Contract/wallet/X coverage: `not connected`",
         ephemeral=True,
     )
 
@@ -806,6 +988,277 @@ async def publish_rules(interaction: discord.Interaction):
     await risk_channel.send(embed=risk_embed, allowed_mentions=discord.AllowedMentions.none())
     await how_it_works.send(embed=workflow_embed, allowed_mentions=discord.AllowedMentions.none())
     await interaction.followup.send("Official welcome, rules, risk disclosure, and workflow published.", ephemeral=True)
+
+
+@tree.command(name="warn", description="Warn a member and record the action.", guild=GUILD)
+@app_commands.describe(member="Member to warn", reason="Reason for the warning")
+async def warn(interaction: discord.Interaction, member: discord.Member, reason: str):
+    if not has_named_role(interaction, MODERATOR_ROLES):
+        await interaction.response.send_message("Moderator permission required.", ephemeral=True)
+        return
+    if member.id == interaction.guild.owner_id or member.bot:
+        await interaction.response.send_message("That account cannot be warned with this command.", ephemeral=True)
+        return
+    await audit_action("WARNING", interaction.user, f"{member} (`{member.id}`)", reason)
+    try:
+        await member.send(f"You received a warning in YRD Alpha.\nReason: {reason}\nRepeated violations may lead to Timeout → Restricted → Ban.")
+    except discord.DiscordException:
+        pass
+    await interaction.response.send_message(f"Warning recorded for {member.mention}.", ephemeral=True)
+
+
+@tree.command(name="timeout_member", description="Temporarily timeout a member.", guild=GUILD)
+@app_commands.describe(member="Member to timeout", minutes="Timeout length in minutes", reason="Reason for timeout")
+async def timeout_member(interaction: discord.Interaction, member: discord.Member, minutes: app_commands.Range[int, 1, 40320], reason: str):
+    if not has_named_role(interaction, MODERATOR_ROLES):
+        await interaction.response.send_message("Moderator permission required.", ephemeral=True)
+        return
+    try:
+        await member.timeout(datetime.now(timezone.utc) + timedelta(minutes=minutes), reason=reason)
+    except discord.Forbidden:
+        await interaction.response.send_message("I cannot timeout that member. Check role order and Moderate Members permission.", ephemeral=True)
+        return
+    await audit_action("TIMEOUT", interaction.user, f"{member} (`{member.id}`)", f"{minutes} minutes — {reason}")
+    await interaction.response.send_message(f"{member.mention} timed out for {minutes} minutes.", ephemeral=True)
+
+
+@tree.command(name="restrict_member", description="Assign or remove the Restricted role.", guild=GUILD)
+@app_commands.describe(member="Member to restrict", enabled="True to restrict; False to remove restriction", reason="Reason")
+async def restrict_member(interaction: discord.Interaction, member: discord.Member, enabled: bool, reason: str):
+    if not has_named_role(interaction, MODERATOR_ROLES):
+        await interaction.response.send_message("Moderator permission required.", ephemeral=True)
+        return
+    role = discord.utils.get(interaction.guild.roles, name="Restricted")
+    if role is None:
+        await interaction.response.send_message("The Restricted role is missing.", ephemeral=True)
+        return
+    try:
+        if enabled:
+            await member.add_roles(role, reason=reason)
+        else:
+            await member.remove_roles(role, reason=reason)
+    except discord.Forbidden:
+        await interaction.response.send_message("I cannot manage Restricted. Move the bot role above it.", ephemeral=True)
+        return
+    action = "RESTRICTED" if enabled else "RESTRICTION REMOVED"
+    await audit_action(action, interaction.user, f"{member} (`{member.id}`)", reason)
+    await interaction.response.send_message(f"{action}: {member.mention}", ephemeral=True)
+
+
+@tree.command(name="ban_member", description="Ban a member for a serious violation.", guild=GUILD)
+@app_commands.describe(member="Member to ban", reason="Reason for ban", delete_hours="Delete recent message history in hours")
+async def ban_member(interaction: discord.Interaction, member: discord.Member, reason: str, delete_hours: app_commands.Range[int, 0, 168] = 0):
+    if not has_named_role(interaction, {"Yurman / Owner", "Admin"}):
+        await interaction.response.send_message("Only Yurman or an Admin can ban members.", ephemeral=True)
+        return
+    if member.id == interaction.guild.owner_id:
+        await interaction.response.send_message("The server owner cannot be banned.", ephemeral=True)
+        return
+    await audit_action("BAN", interaction.user, f"{member} (`{member.id}`)", reason)
+    try:
+        await interaction.guild.ban(member, reason=reason, delete_message_seconds=delete_hours * 3600)
+    except discord.Forbidden:
+        await interaction.response.send_message("I cannot ban that member. Check role order and Ban Members permission.", ephemeral=True)
+        return
+    await interaction.response.send_message(f"Banned {member}.", ephemeral=True)
+
+
+@tree.command(name="report_scam", description="Privately report scam evidence to staff.", guild=GUILD)
+@app_commands.describe(subject="User, token, project, or wallet being reported", evidence="Links, wallet addresses, transaction IDs, and what happened")
+async def report_scam(interaction: discord.Interaction, subject: str, evidence: str):
+    channel = await find_text_channel("scam-evidence")
+    if channel is None:
+        await interaction.response.send_message("I could not find the private #scam-evidence channel.", ephemeral=True)
+        return
+    embed = discord.Embed(title="SCAM EVIDENCE REPORT", color=discord.Color.red(), timestamp=datetime.now(timezone.utc))
+    embed.add_field(name="Reporter", value=f"{interaction.user} (`{interaction.user.id}`)", inline=False)
+    embed.add_field(name="Subject", value=subject[:1000], inline=False)
+    embed.add_field(name="Evidence", value=evidence[:1000], inline=False)
+    embed.set_footer(text="Staff: preserve screenshots, user IDs, wallet addresses, contracts, links, and timestamps.")
+    await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+    await interaction.response.send_message("Your report was sent privately to staff. Do not confront suspected scammers.", ephemeral=True)
+
+
+TICKET_TYPES = {"membership", "billing", "server", "scout", "scam", "member", "appeal", "premium", "other"}
+
+
+@tree.command(name="ticket", description="Open a private YRD Alpha support ticket.", guild=GUILD)
+@app_commands.describe(category="Membership, billing, server, scout, scam, member, appeal, premium, or other", details="Explain what you need help with")
+async def ticket(interaction: discord.Interaction, category: str, details: str):
+    category_key = category.lower().strip()
+    if category_key not in TICKET_TYPES:
+        await interaction.response.send_message("Category must be membership, billing, server, scout, scam, member, appeal, premium, or other.", ephemeral=True)
+        return
+    guild = interaction.guild
+    support_category = discord.utils.get(guild.categories, name="SUPPORT TICKETS")
+    try:
+        if support_category is None:
+            support_category = await guild.create_category("SUPPORT TICKETS", reason="YRD Alpha private support")
+        safe_name = re.sub(r"[^a-z0-9-]", "-", interaction.user.name.lower())[:16].strip("-") or "member"
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, attach_files=True),
+        }
+        bot_member = guild.me
+        if bot_member:
+            overwrites[bot_member] = discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True, read_message_history=True)
+        for role in guild.roles:
+            if role.name in SUPPORT_ROLES:
+                overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_messages=True)
+        channel = await guild.create_text_channel(
+            f"ticket-{safe_name}-{str(interaction.user.id)[-4:]}",
+            category=support_category,
+            topic=f"YRD-TICKET|{interaction.user.id}|{category_key}",
+            overwrites=overwrites,
+            reason=f"Support ticket opened by {interaction.user}",
+        )
+    except discord.Forbidden:
+        await interaction.response.send_message("I cannot create private ticket channels. Check Manage Channels permission.", ephemeral=True)
+        return
+    await channel.send(
+        f"{interaction.user.mention} **Private {category_key.title()} Ticket**\n{details}\n\n"
+        "YRD Alpha staff will never ask for your seed phrase or private key. Use `/close_ticket` when resolved.",
+        allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+    )
+    await audit_action("TICKET OPENED", interaction.user, channel.mention, f"{category_key}: {details}")
+    await interaction.response.send_message(f"Private ticket created: {channel.mention}", ephemeral=True)
+
+
+@tree.command(name="close_ticket", description="Close and archive the current support ticket.", guild=GUILD)
+async def close_ticket(interaction: discord.Interaction):
+    channel = interaction.channel
+    topic = getattr(channel, "topic", "") or ""
+    if not topic.startswith("YRD-TICKET|"):
+        await interaction.response.send_message("Use this command inside a YRD Alpha ticket channel.", ephemeral=True)
+        return
+    parts = topic.split("|")
+    creator_id = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+    if interaction.user.id != creator_id and not has_named_role(interaction, SUPPORT_ROLES):
+        await interaction.response.send_message("Only the ticket owner or staff can close this ticket.", ephemeral=True)
+        return
+    creator = interaction.guild.get_member(creator_id)
+    try:
+        if creator:
+            await channel.set_permissions(creator, view_channel=True, send_messages=False, read_message_history=True)
+        new_name = channel.name if channel.name.startswith("closed-") else ("closed-" + channel.name)[:100]
+        await channel.edit(name=new_name, topic=topic + "|CLOSED", reason="Support ticket archived")
+    except discord.Forbidden:
+        await interaction.response.send_message("I cannot archive this channel. Check Manage Channels permission.", ephemeral=True)
+        return
+    await audit_action("TICKET CLOSED", interaction.user, channel.mention, "Ticket archived; history preserved")
+    await interaction.response.send_message("Ticket closed and preserved for staff records.")
+
+
+@tree.command(name="book_yurman", description="Request a call or review with Yurman.", guild=GUILD)
+@app_commands.describe(reason="Reason for the request", preferred_time="Preferred date/time and timezone")
+async def book_yurman(interaction: discord.Interaction, reason: str, preferred_time: str):
+    channel = await find_text_channel("support-log")
+    if channel is None:
+        await interaction.response.send_message("I could not find the private #support-log channel.", ephemeral=True)
+        return
+    premium = any(role.name == "YRD Alpha Premium" for role in getattr(interaction.user, "roles", []))
+    embed = discord.Embed(title="CALL REQUEST — PREMIUM PRIORITY" if premium else "CALL REQUEST", color=discord.Color.gold(), timestamp=datetime.now(timezone.utc))
+    embed.add_field(name="Member", value=f"{interaction.user} (`{interaction.user.id}`)", inline=False)
+    embed.add_field(name="Preferred Time", value=preferred_time[:1000], inline=False)
+    embed.add_field(name="Reason", value=reason[:1000], inline=False)
+    embed.add_field(name="Status", value="Awaiting staff confirmation", inline=False)
+    await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+    await interaction.response.send_message("Your request was sent to staff. A time is not confirmed until staff responds.", ephemeral=True)
+
+
+@tree.command(name="concierge", description="Ask the YRD Assistant a common server or trading-education question.", guild=GUILD)
+@app_commands.describe(question="Your question")
+async def concierge(interaction: discord.Interaction, question: str):
+    q = question.lower()
+    if "market cap" in q:
+        answer = "Market cap is token price multiplied by circulating supply. It is not the same as liquidity or cash available to sell."
+    elif "2x" in q or "double" in q:
+        answer = "A 2x means the value doubled: a $50 paper position would become $100 before fees and slippage."
+    elif "premium" in q:
+        answer = "Premium pricing and payments are not active yet. Staff will announce them officially in #yrd-updates."
+    elif "ticket" in q or "support" in q:
+        answer = "Use `/ticket` with a category and details to create a private support channel."
+    elif "yurman" in q or "call" in q:
+        answer = "Yurman may not be available right now. Use `/book_yurman` to send a private request to staff."
+    elif "scout" in q:
+        answer = "Scout reports possible setups and risk signals. Public alerts may be unreviewed; only Yurman/Admin decisions appear as reviewed. No alert guarantees profit."
+    elif "risk" in q or "stop" in q:
+        answer = "Use `/risk` before entry to calculate position size, loss at stop, and risk/reward. Decide maximum loss before trading."
+    else:
+        answer = "I do not have a verified answer for that yet. Use `/ticket` so staff can help without guessing."
+    await interaction.response.send_message(f"🧠 **YRD Assistant**\n{answer}\n\n{DISCLAIMER}", ephemeral=True)
+
+
+@tree.command(name="feedback", description="Send an anonymous suggestion to the community feedback channel.", guild=GUILD)
+@app_commands.describe(suggestion="Your suggestion")
+async def feedback(interaction: discord.Interaction, suggestion: str):
+    channel = await find_text_channel("feedback")
+    if channel is None:
+        await interaction.response.send_message("I could not find #feedback.", ephemeral=True)
+        return
+    embed = discord.Embed(title="ANONYMOUS MEMBER FEEDBACK", description=suggestion[:4000], color=discord.Color.purple(), timestamp=datetime.now(timezone.utc))
+    await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+    await interaction.response.send_message("Feedback submitted anonymously to the public channel.", ephemeral=True)
+
+
+@tree.command(name="poll_create", description="Create an official two-option community poll.", guild=GUILD)
+@app_commands.describe(question="Poll question", option_one="First option", option_two="Second option")
+async def poll_create(interaction: discord.Interaction, question: str, option_one: str, option_two: str):
+    if not is_reviewer(interaction):
+        await interaction.response.send_message("Only Yurman or an Admin can create official polls.", ephemeral=True)
+        return
+    channel = interaction.channel
+    embed = discord.Embed(title="YRD ALPHA POLL", description=question[:4000], color=discord.Color.blue())
+    embed.add_field(name="1️⃣ Option 1", value=option_one[:1000], inline=False)
+    embed.add_field(name="2️⃣ Option 2", value=option_two[:1000], inline=False)
+    message = await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+    try:
+        await message.add_reaction("1️⃣")
+        await message.add_reaction("2️⃣")
+    except discord.Forbidden:
+        pass
+    await interaction.response.send_message("Poll posted.", ephemeral=True)
+
+
+@tree.command(name="pnl_summary", description="Privately calculate personal P&L statistics.", guild=GUILD)
+@app_commands.describe(starting_balance="Starting balance", total_wins="Total dollars gained", total_losses="Total dollars lost", wins="Number of wins", losses="Number of losses", largest_drawdown="Largest drawdown in dollars")
+async def pnl_summary(interaction: discord.Interaction, starting_balance: float, total_wins: float, total_losses: float, wins: app_commands.Range[int, 0, 100000], losses: app_commands.Range[int, 0, 100000], largest_drawdown: float):
+    if min(starting_balance, total_wins, total_losses, largest_drawdown) < 0:
+        await interaction.response.send_message("Use positive numbers; enter losses as a positive total.", ephemeral=True)
+        return
+    trades = wins + losses
+    current = starting_balance + total_wins - total_losses
+    avg_win = total_wins / wins if wins else 0
+    avg_loss = total_losses / losses if losses else 0
+    win_rate = wins / trades * 100 if trades else 0
+    await interaction.response.send_message(
+        "📊 **Private P&L Summary**\n"
+        f"Starting balance: `${starting_balance:,.2f}`\nCurrent balance: `${current:,.2f}`\n"
+        f"Wins / Losses: `{wins} / {losses}`\nWin rate: `{win_rate:.1f}%`\n"
+        f"Average win: `${avg_win:,.2f}`\nAverage loss: `${avg_loss:,.2f}`\n"
+        f"Largest drawdown: `${largest_drawdown:,.2f}`\n\nOnly you can see this response.",
+        ephemeral=True,
+    )
+
+
+@tree.command(name="incident", description="Record a private operational incident.", guild=GUILD)
+@app_commands.describe(title="Short incident title", systems="Systems affected", details="What happened and response so far")
+async def incident(interaction: discord.Interaction, title: str, systems: str, details: str):
+    if not has_named_role(interaction, MODERATOR_ROLES):
+        await interaction.response.send_message("Staff permission required.", ephemeral=True)
+        return
+    channel = await find_text_channel("incident-room")
+    if channel is None:
+        await interaction.response.send_message("I could not find #incident-room.", ephemeral=True)
+        return
+    embed = discord.Embed(title=f"INCIDENT — {title[:200]}", color=discord.Color.orange(), timestamp=datetime.now(timezone.utc))
+    embed.add_field(name="Systems Affected", value=systems[:1000], inline=False)
+    embed.add_field(name="What Happened / Response", value=details[:1000], inline=False)
+    embed.add_field(name="Status", value="OPEN", inline=False)
+    embed.add_field(name="Recorded By", value=f"{interaction.user} (`{interaction.user.id}`)", inline=False)
+    await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+    await audit_action("INCIDENT OPENED", interaction.user, title, systems)
+    await interaction.response.send_message("Incident recorded privately.", ephemeral=True)
 
 
 async def main():
