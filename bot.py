@@ -391,6 +391,49 @@ def money_text(value) -> str:
     return f"${number:,.2f}"
 
 
+def pair_age_minutes(pair: dict):
+    created_ms = pair.get("pairCreatedAt")
+    if not isinstance(created_ms, (int, float)):
+        return None
+    return max(0, int((datetime.now(timezone.utc).timestamp() * 1000 - created_ms) / 60000))
+
+
+def social_link_count(pair: dict) -> int:
+    info = pair.get("info") or {}
+    links = []
+    if isinstance(info, dict):
+        links.extend(info.get("socials") or [])
+    links.extend(pair.get("_profile_links") or [])
+    social_domains = ("x.com", "twitter.com", "t.me", "telegram", "discord", "instagram.com", "tiktok.com")
+    found = set()
+    for item in links:
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("url") or "").strip().lower()
+        link_type = str(item.get("type") or item.get("label") or "").strip().lower()
+        if url and (any(domain in url for domain in social_domains) or link_type in {"twitter", "x", "telegram", "discord", "instagram", "tiktok"}):
+            found.add(url)
+    return len(found)
+
+
+async def current_sol_price(session: aiohttp.ClientSession) -> float:
+    if SOLANA_TRACKER_API_KEY:
+        try:
+            data = await get_json(
+                session,
+                "https://data.solanatracker.io/price",
+                headers={"x-api-key": SOLANA_TRACKER_API_KEY},
+                params={"token": "So11111111111111111111111111111111111111112"},
+            )
+            price = float(data.get("price") or 0) if isinstance(data, dict) else 0
+            if price > 0:
+                return price
+        except Exception as exc:
+            log.warning("Could not retrieve current SOL price: %s", exc)
+    # Conservative fallback used only if the configured price source is unavailable.
+    return 250.0
+
+
 async def notify_source_failure(source: str, detail: str):
     """Report incomplete coverage at most once per source per hour."""
     now = datetime.now(timezone.utc)
@@ -549,10 +592,47 @@ async def publish_live_candidate(pair: dict, engine: str, score: int):
     volume_h24 = float(((pair.get("volume") or {}).get("h24")) or 0)
     h1 = ((pair.get("txns") or {}).get("h1")) or {}
     buys, sells = int(h1.get("buys") or 0), int(h1.get("sells") or 0)
-    created_ms = pair.get("pairCreatedAt")
-    age_minutes = max(0, int((datetime.now(timezone.utc).timestamp() * 1000 - created_ms) / 60000)) if isinstance(created_ms, (int, float)) else None
-    confidence = "HIGH" if score >= 85 else "MEDIUM"
+    age_minutes = pair_age_minutes(pair)
+    socials = social_link_count(pair)
+    sol_price_usd = float(pair.get("_sol_price_usd") or 250)
+    early_mode = engine == "EARLY SOCIAL SCANNER"
     tracker_score = solana_data.get("risk_score")
+    top10 = solana_data.get("top10_pct")
+    critical_flags = " ".join(solana_data.get("risk_flags") or []).lower()
+    quality_failures = []
+    if early_mode:
+        if age_minutes is None or age_minutes > 60:
+            quality_failures.append("not a launch from the last 60 minutes")
+        if socials < 1:
+            quality_failures.append("no verified social link")
+        if liquidity < sol_price_usd:
+            quality_failures.append("less than 1 SOL worth of liquidity")
+        if buys < 1:
+            quality_failures.append("no recent buy activity")
+    else:
+        if liquidity < 75_000:
+            quality_failures.append("liquidity below $75K")
+        if volume_h24 < 150_000:
+            quality_failures.append("24h volume below $150K")
+        if buys + sells < 80:
+            quality_failures.append("fewer than 80 one-hour transactions")
+        if buys < max(1, sells) * 1.10:
+            quality_failures.append("buy activity is not at least 10% above sells")
+        if market_cap > 0 and liquidity / market_cap < 0.05:
+            quality_failures.append("liquidity is below 5% of market cap")
+    if solana_data.get("rugged"):
+        quality_failures.append("Solana Tracker rugged flag")
+    if isinstance(tracker_score, (int, float)) and tracker_score >= 8:
+        quality_failures.append(f"Solana risk score {tracker_score}/10")
+    concentration_limit = 70 if early_mode else 55
+    if isinstance(top10, (int, float)) and top10 > concentration_limit:
+        quality_failures.append(f"top-10 holders control {top10:.1f}%")
+    if any(flag in critical_flags for flag in ("freeze authority enabled", "mint authority enabled")):
+        quality_failures.append("dangerous token authority enabled")
+    if quality_failures:
+        log.info("QUALITY MODE rejected %s (%s): %s", symbol, contract, "; ".join(quality_failures))
+        return False
+    confidence = "HIGH" if score >= 85 else "MEDIUM"
     if solana_data.get("rugged"):
         risk = "EXTREME — RUG FLAG"
     elif isinstance(tracker_score, (int, float)) and tracker_score >= 9:
@@ -564,7 +644,6 @@ async def publish_live_candidate(pair: dict, engine: str, score: int):
     tracker_risk = f"{tracker_score}/10" if isinstance(tracker_score, (int, float)) else "Unavailable"
     risk_flags = solana_data.get("risk_flags") or []
     flags_text = ", ".join(risk_flags) if risk_flags else ("None reported" if solana_data.get("status") == "active" else "Unavailable")
-    top10 = solana_data.get("top10_pct")
     top10_text = f"{top10:.1f}%" if isinstance(top10, (int, float)) else "Unavailable"
     holder_count = solana_data.get("holder_count")
     holder_text = f"{int(holder_count):,}" if isinstance(holder_count, (int, float)) else "Unavailable"
@@ -580,7 +659,8 @@ async def publish_live_candidate(pair: dict, engine: str, score: int):
         title=f"🔎 YRD ALPHA SCOUT — POSSIBLE SETUP: ${symbol}",
         description=(
             f"**Engine:** {engine}\n"
-            "DEX market activity passed the current screening threshold.\n\n"
+            + ("🆕 **EARLY MODE:** new launch with social presence and at least 1 SOL of liquidity.\n\n" if early_mode else "✅ **QUALITY MODE:** passed stronger market and risk screening.\n\n")
+            +
             "⚠️ **Yurman has NOT reviewed this setup yet.**\n"
             "On-chain and social signals are screening evidence, not instructions to buy. Investigate before acting."
         ),
@@ -595,6 +675,7 @@ async def publish_live_candidate(pair: dict, engine: str, score: int):
         ("Confidence", confidence, True), ("Signal Score", f"{score}/100", True),
         ("Solana Risk Score", tracker_risk, True), ("Top-10 Holders", top10_text, True),
         ("Holder Count", holder_text, True), ("Safety Flags", flags_text[:1024], False),
+        ("Social Links", str(socials), True),
         ("X Mentions", x_mentions_text, True), ("X Engagement", x_engagement_text, True),
         ("Social Momentum", str(x_data.get("momentum") or "Unavailable"), True),
         ("Contract", contract, False), ("Source Coverage", coverage[:1024], False),
@@ -642,6 +723,7 @@ async def dex_scanner_loop():
     while not client.is_closed():
         try:
             async with aiohttp.ClientSession(timeout=timeout, headers={"User-Agent": "YRD-Alpha-Scout/1.0"}) as session:
+                sol_price_usd = await current_sol_price(session)
                 sources = [
                     ("NEW PROFILE SCANNER", "https://api.dexscreener.com/token-profiles/latest/v1"),
                     ("MOMENTUM SCANNER", "https://api.dexscreener.com/token-boosts/top/v1"),
@@ -656,9 +738,12 @@ async def dex_scanner_loop():
                     if not isinstance(profiles, list):
                         continue
                     addresses = []
+                    profile_links = {}
                     for profile in profiles:
                         if profile.get("chainId") == "solana" and profile.get("tokenAddress"):
-                            addresses.append(profile["tokenAddress"])
+                            address = profile["tokenAddress"]
+                            addresses.append(address)
+                            profile_links[address] = profile.get("links") or []
                         if len(addresses) >= 20:
                             break
                     if not addresses:
@@ -672,15 +757,30 @@ async def dex_scanner_loop():
                     best_by_token = {}
                     for pair in pairs if isinstance(pairs, list) else []:
                         address = str(((pair.get("baseToken") or {}).get("address")) or "")
+                        pair["_profile_links"] = profile_links.get(address) or []
+                        pair["_sol_price_usd"] = sol_price_usd
                         liquidity = float(((pair.get("liquidity") or {}).get("usd")) or 0)
                         if address and (address not in best_by_token or liquidity > float(((best_by_token[address].get("liquidity") or {}).get("usd")) or 0)):
                             best_by_token[address] = pair
                     for pair in best_by_token.values():
                         score = score_pair(pair)
-                        if score >= 60:
+                        if score >= 75:
                             candidates.append((score, engine, pair))
+                        else:
+                            age = pair_age_minutes(pair)
+                            if engine == "NEW PROFILE SCANNER" and age is not None and age <= 60 and social_link_count(pair) >= 1 and float(((pair.get("liquidity") or {}).get("usd")) or 0) >= sol_price_usd:
+                                candidates.append((score, "EARLY SOCIAL SCANNER", pair))
                 posted = 0
-                for score, engine, pair in sorted(candidates, key=lambda item: item[0], reverse=True):
+                ranked = sorted(candidates, key=lambda item: item[0], reverse=True)
+                early_pick = next((item for item in ranked if item[1] == "EARLY SOCIAL SCANNER"), None)
+                quality_pick = next((item for item in ranked if item[1] != "EARLY SOCIAL SCANNER"), None)
+                selected = [item for item in (early_pick, quality_pick) if item is not None]
+                selected_contracts = {str(((item[2].get("baseToken") or {}).get("address")) or "") for item in selected}
+                selected.extend(
+                    item for item in ranked
+                    if str(((item[2].get("baseToken") or {}).get("address")) or "") not in selected_contracts
+                )
+                for score, engine, pair in selected:
                     if await publish_live_candidate(pair, engine, score):
                         posted += 1
                     if posted >= 2:
@@ -768,7 +868,7 @@ async def post_startup_notice_once():
             "🟢 **YRD Alpha Scout is ONLINE**\n"
             f"Connected: `{utc_now_text()}`\n"
             "Phase 2 review workflow: **active**.\n"
-            "DEX Screener public scanner: **active**.\n"
+            "DEX Screener QUALITY MODE: **active (75+ score)**.\n"
             f"Solana Tracker: **{_source_health['Solana Tracker']}**.\n"
             f"X/Twitter: **{_source_health['X/Twitter']}**.\n"
             "Axiom, FOMO, Robinhood, and Trenchers: **awaiting authorized API access**.",
@@ -812,7 +912,7 @@ async def status(interaction: discord.Interaction):
         f"Latency: `{round(client.latency * 1000)} ms`\n"
         f"Uptime: `{hours}h {minutes}m {secs}s`\n"
         "Review workflow: `active`\n"
-        f"DEX Screener: `{_source_health['DEX Screener']}`\n"
+        f"DEX Screener QUALITY MODE: `{_source_health['DEX Screener']} — minimum 75/100`\n"
         f"Solana Tracker: `{_source_health['Solana Tracker']}`\n"
         f"X/Twitter: `{_source_health['X/Twitter']}`\n"
         "Axiom/FOMO/Robinhood/Trenchers: `awaiting authorized API access`",
