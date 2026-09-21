@@ -152,6 +152,27 @@ class ReviewView(discord.ui.View):
         target = await find_text_channel(target_name)
         if target:
             await target.send(embed=result, allowed_mentions=discord.AllowedMentions.none())
+
+        journal = await find_text_channel("trade-journal")
+        if journal:
+            journal_entry = discord.Embed(
+                title=f"📓 JOURNAL — {token}",
+                description="Permanent review record. Wins and losses must remain visible.",
+                color=color,
+                timestamp=datetime.now(timezone.utc),
+            )
+            journal_entry.add_field(name="Scout Alert", value=public_url or "Unavailable", inline=False)
+            journal_entry.add_field(name="Token", value=token, inline=True)
+            journal_entry.add_field(name="Market Cap at Review", value=market_cap, inline=True)
+            journal_entry.add_field(name="Yurman's Decision", value=action, inline=True)
+            journal_entry.add_field(name="Observed Level", value="Not recorded", inline=True)
+            journal_entry.add_field(name="Highest Afterwards", value="Monitoring", inline=True)
+            journal_entry.add_field(name="Lowest Afterwards", value="Monitoring", inline=True)
+            journal_entry.add_field(name="Result", value="Open / monitoring", inline=True)
+            journal_entry.add_field(name="Rug Status", value="Warning issued" if action == "RUG WARNING" else "Not confirmed", inline=True)
+            journal_entry.add_field(name="Lesson Learned", value="To be completed after the setup ends.", inline=False)
+            journal_entry.set_footer(text=DISCLAIMER)
+            await journal.send(embed=journal_entry, allowed_mentions=discord.AllowedMentions.none())
         await edit_linked_message(public_url, action, color)
         await edit_linked_message(waiting_url, action, color)
 
@@ -336,6 +357,182 @@ async def post_update(interaction: discord.Interaction, message: str):
         return
     await channel.send("**YRD Alpha update**\n" + message, allowed_mentions=discord.AllowedMentions.none())
     await interaction.response.send_message("Update posted.", ephemeral=True)
+
+
+@tree.command(name="risk", description="Calculate risk before entering a position.", guild=GUILD)
+@app_commands.describe(bankroll="Your total trading bankroll in dollars", entry="Planned position size in dollars", stop_percent="Stop distance as a percent", target_percent="Optional profit target as a percent")
+async def risk(interaction: discord.Interaction, bankroll: float, entry: float, stop_percent: float, target_percent: float = 40.0):
+    if bankroll <= 0 or entry <= 0 or stop_percent <= 0 or target_percent <= 0:
+        await interaction.response.send_message("All values must be greater than zero.", ephemeral=True)
+        return
+    if entry > bankroll:
+        await interaction.response.send_message("The planned position cannot be larger than the bankroll.", ephemeral=True)
+        return
+    if stop_percent > 100:
+        await interaction.response.send_message("Stop percent cannot exceed 100%.", ephemeral=True)
+        return
+    dollars_at_risk = entry * stop_percent / 100
+    target_profit = entry * target_percent / 100
+    rr = target_percent / stop_percent
+    embed = discord.Embed(
+        title="🧮 YRD RISK — PLAN BEFORE ENTRY",
+        description="Decide the maximum acceptable loss before entering. This calculator does not predict outcomes.",
+        color=discord.Color.blue(),
+    )
+    embed.add_field(name="Bankroll", value=f"${bankroll:,.2f}", inline=True)
+    embed.add_field(name="Position Size", value=f"${entry:,.2f} ({entry / bankroll * 100:.1f}% of bankroll)", inline=True)
+    embed.add_field(name="Loss at Stop", value=f"${dollars_at_risk:,.2f} ({dollars_at_risk / bankroll * 100:.1f}% of bankroll)", inline=True)
+    embed.add_field(name="Selected Target", value=f"+{target_percent:.1f}% = ${target_profit:,.2f}", inline=True)
+    embed.add_field(name="Risk / Reward", value=f"1 : {rr:.2f}", inline=True)
+    embed.add_field(name="Profit Reference", value=f"1R: ${dollars_at_risk:,.2f}\n2R: ${dollars_at_risk * 2:,.2f}\n3R: ${dollars_at_risk * 3:,.2f}", inline=True)
+    embed.set_footer(text=DISCLAIMER)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@tree.command(name="paper_open", description="Open a fake-money paper trade.", guild=GUILD)
+@app_commands.describe(token="Token symbol", amount="Fake dollars used", entry_price="Simulated entry price", stop_percent="Planned stop percent", take_profit_percent="Planned target percent")
+async def paper_open(interaction: discord.Interaction, token: str, amount: float, entry_price: float, stop_percent: float = 20.0, take_profit_percent: float = 40.0):
+    if amount <= 0 or entry_price <= 0 or stop_percent <= 0 or stop_percent > 100 or take_profit_percent <= 0:
+        await interaction.response.send_message("Use positive values and a stop between 0% and 100%.", ephemeral=True)
+        return
+    channel = await find_text_channel("paper-trades")
+    if channel is None:
+        await interaction.response.send_message("I could not find #paper-trades.", ephemeral=True)
+        return
+    embed = discord.Embed(
+        title=f"🧪 PAPER TRADE OPEN — {token.upper()}",
+        description="Fake-money practice only. No real order was placed.",
+        color=discord.Color.blurple(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(name="Member", value=interaction.user.mention, inline=True)
+    embed.add_field(name="Fake Position", value=f"${amount:,.2f}", inline=True)
+    embed.add_field(name="Entry Price", value=f"{entry_price:.12g}", inline=True)
+    embed.add_field(name="Stop", value=f"-{stop_percent:.2f}%", inline=True)
+    embed.add_field(name="Target", value=f"+{take_profit_percent:.2f}%", inline=True)
+    embed.add_field(name="Status", value="OPEN", inline=True)
+    embed.set_footer(text=f"YRD-PAPER|{interaction.user.id}|OPEN")
+    message = await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+    await interaction.response.send_message(f"Paper trade opened. Trade ID: `{message.id}`", ephemeral=True)
+
+
+@tree.command(name="paper_close", description="Close one of your fake-money paper trades.", guild=GUILD)
+@app_commands.describe(trade_id="Trade ID returned by /paper_open", exit_price="Simulated exit price")
+async def paper_close(interaction: discord.Interaction, trade_id: str, exit_price: float):
+    if not trade_id.isdigit() or exit_price <= 0:
+        await interaction.response.send_message("Enter a valid numeric Trade ID and a positive exit price.", ephemeral=True)
+        return
+    channel = await find_text_channel("paper-trades")
+    if channel is None:
+        await interaction.response.send_message("I could not find #paper-trades.", ephemeral=True)
+        return
+    try:
+        message = await channel.fetch_message(int(trade_id))
+    except discord.NotFound:
+        await interaction.response.send_message("Paper trade not found in #paper-trades.", ephemeral=True)
+        return
+    except discord.DiscordException:
+        await interaction.response.send_message("I could not load that paper trade.", ephemeral=True)
+        return
+    if not message.embeds:
+        await interaction.response.send_message("That message is not a paper trade.", ephemeral=True)
+        return
+    embed = message.embeds[0].copy()
+    footer = embed.footer.text or ""
+    expected_prefix = f"YRD-PAPER|{interaction.user.id}|"
+    if not footer.startswith(expected_prefix) and not is_reviewer(interaction):
+        await interaction.response.send_message("You can only close your own paper trades.", ephemeral=True)
+        return
+    if footer.endswith("|CLOSED"):
+        await interaction.response.send_message("That paper trade is already closed.", ephemeral=True)
+        return
+    try:
+        amount = float(field_value(embed, "Fake Position").replace("$", "").replace(",", ""))
+        entry_price = float(field_value(embed, "Entry Price"))
+    except ValueError:
+        await interaction.response.send_message("The saved paper trade data is invalid.", ephemeral=True)
+        return
+    return_percent = (exit_price / entry_price - 1) * 100
+    pnl = amount * return_percent / 100
+    result = "WIN" if pnl > 0 else "LOSS" if pnl < 0 else "BREAKEVEN"
+    embed.title = embed.title.replace("OPEN", f"CLOSED — {result}")
+    embed.color = discord.Color.green() if pnl > 0 else discord.Color.red() if pnl < 0 else discord.Color.greyple()
+    embed.add_field(name="Exit Price", value=f"{exit_price:.12g}", inline=True)
+    embed.add_field(name="Return", value=f"{return_percent:+.2f}%", inline=True)
+    embed.add_field(name="Fake P&L", value=f"${pnl:+,.2f}", inline=True)
+    embed.set_footer(text=f"YRD-PAPER|{interaction.user.id}|CLOSED")
+    await message.edit(embed=embed)
+    results = await find_text_channel("paper-leaderboard")
+    if results:
+        recap = discord.Embed(title=f"🧪 PAPER RESULT — {result}", color=embed.color, timestamp=datetime.now(timezone.utc))
+        recap.add_field(name="Member", value=interaction.user.mention, inline=True)
+        recap.add_field(name="Token", value=embed.title.split("—")[1].strip() if "—" in embed.title else "Unknown", inline=True)
+        recap.add_field(name="Fake P&L", value=f"${pnl:+,.2f} ({return_percent:+.2f}%)", inline=True)
+        recap.description = "Leaderboard values reward consistency and risk control—not claimed real profits."
+        await results.send(embed=recap, allowed_mentions=discord.AllowedMentions.none())
+    wins_losses = await find_text_channel("wins-and-losses")
+    if wins_losses:
+        await wins_losses.send(f"🧪 {interaction.user.mention} closed a paper trade: **{result}**, fake P&L `${pnl:+,.2f}`. Wins and losses stay visible.", allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False))
+    await interaction.response.send_message(f"Paper trade closed: **{result}**, fake P&L `${pnl:+,.2f}`.", ephemeral=True)
+
+
+@tree.command(name="paper_stats", description="View your recent fake-money paper-trading statistics.", guild=GUILD)
+async def paper_stats(interaction: discord.Interaction):
+    channel = await find_text_channel("paper-trades")
+    if channel is None:
+        await interaction.response.send_message("I could not find #paper-trades.", ephemeral=True)
+        return
+    pnls = []
+    async for message in channel.history(limit=300, oldest_first=True):
+        if not message.embeds:
+            continue
+        embed = message.embeds[0]
+        if (embed.footer.text or "") != f"YRD-PAPER|{interaction.user.id}|CLOSED":
+            continue
+        value = field_value(embed, "Fake P&L", "")
+        try:
+            pnls.append(float(value.replace("$", "").replace(",", "").replace("+", "")))
+        except ValueError:
+            continue
+    wins = sum(1 for value in pnls if value > 0)
+    losses = sum(1 for value in pnls if value < 0)
+    running = peak = max_drawdown = 0.0
+    for value in pnls:
+        running += value
+        peak = max(peak, running)
+        max_drawdown = max(max_drawdown, peak - running)
+    total = sum(pnls)
+    win_rate = wins / len(pnls) * 100 if pnls else 0
+    await interaction.response.send_message(
+        "🧪 **Your Paper Statistics**\n"
+        f"Closed trades: `{len(pnls)}`\nWins / Losses: `{wins} / {losses}`\n"
+        f"Win rate: `{win_rate:.1f}%`\nFake net P&L: `${total:+,.2f}`\n"
+        f"Largest fake drawdown: `${max_drawdown:,.2f}`\n"
+        "Consistency and drawdown control matter more than one lucky trade.",
+        ephemeral=True,
+    )
+
+
+@tree.command(name="emergency_alert", description="Send an owner/admin risk alert.", guild=GUILD)
+@app_commands.describe(alert_type="RUG, LIQUIDITY, WHALE, CONTRACT, or NETWORK", token="Token or market name", details="Observed facts and source context")
+async def emergency_alert(interaction: discord.Interaction, alert_type: str, token: str, details: str):
+    if not is_reviewer(interaction):
+        await interaction.response.send_message("Only Yurman or an Admin can issue emergency alerts.", ephemeral=True)
+        return
+    alert_type = alert_type.upper().strip()
+    target_map = {"RUG": "rug-alerts", "LIQUIDITY": "liquidity-alerts", "WHALE": "whale-watch", "CONTRACT": "rug-alerts", "NETWORK": "network-status"}
+    if alert_type not in target_map:
+        await interaction.response.send_message("Type must be RUG, LIQUIDITY, WHALE, CONTRACT, or NETWORK.", ephemeral=True)
+        return
+    channel = await find_text_channel(target_map[alert_type])
+    if channel is None:
+        await interaction.response.send_message(f"I could not find #{target_map[alert_type]}.", ephemeral=True)
+        return
+    embed = discord.Embed(title=f"🚨 {alert_type} ALERT — {token}", description=details, color=discord.Color.red(), timestamp=datetime.now(timezone.utc))
+    embed.add_field(name="Required Action", value="Investigate before acting. This alert is not an automatic buy or sell instruction.", inline=False)
+    embed.set_footer(text=DISCLAIMER)
+    await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+    await interaction.response.send_message(f"Alert posted in #{target_map[alert_type]}.", ephemeral=True)
 
 
 async def main():
