@@ -13,6 +13,8 @@ log = logging.getLogger("yrd-alpha")
 
 TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 GUILD_ID_RAW = os.getenv("GUILD_ID", "").strip()
+SOLANA_TRACKER_API_KEY = os.getenv("SOLANA_TRACKER_API_KEY", "").strip()
+X_BEARER_TOKEN = os.getenv("X_BEARER_TOKEN", "").strip()
 if not TOKEN:
     raise RuntimeError("DISCORD_TOKEN is missing. Add it as a private Railway service variable.")
 if not GUILD_ID_RAW.isdigit():
@@ -28,6 +30,12 @@ _started_at = datetime.now(timezone.utc)
 _startup_notice_sent = False
 _scanner_task = None
 _scanner_seen = set()
+_source_health = {
+    "DEX Screener": "active",
+    "Solana Tracker": "configured; awaiting first check" if SOLANA_TRACKER_API_KEY else "not configured",
+    "X/Twitter": "configured; awaiting first check" if X_BEARER_TOKEN else "not configured",
+}
+_source_last_notice = {}
 
 DISCLAIMER = "Research only. Not financial advice or a guaranteed return. Meme coins can lose their entire value."
 REVIEW_ROLES = {"Yurman / Owner", "Admin"}
@@ -383,6 +391,147 @@ def money_text(value) -> str:
     return f"${number:,.2f}"
 
 
+async def notify_source_failure(source: str, detail: str):
+    """Report incomplete coverage at most once per source per hour."""
+    now = datetime.now(timezone.utc)
+    previous = _source_last_notice.get(source)
+    if previous and now - previous < timedelta(hours=1):
+        return
+    _source_last_notice[source] = now
+    channel = await find_text_channel("bot-status")
+    if channel:
+        try:
+            await channel.send(
+                f"⚠️ YRD Alpha Scout data source **{source}** is temporarily unavailable: {detail[:250]}. "
+                "Related Scout fields will be marked unavailable; other sources remain active.",
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except discord.DiscordException:
+            log.exception("Could not report %s source failure", source)
+
+
+async def get_json(session: aiohttp.ClientSession, url: str, *, headers=None, params=None):
+    async with session.get(url, headers=headers, params=params) as response:
+        if response.status != 200:
+            body = (await response.text())[:300]
+            raise RuntimeError(f"HTTP {response.status}: {body}")
+        return await response.json()
+
+
+async def solana_tracker_enrichment(session: aiohttp.ClientSession, contract: str) -> dict:
+    result = {
+        "status": "not configured",
+        "risk_score": None,
+        "rugged": None,
+        "risk_flags": [],
+        "top10_pct": None,
+        "holder_count": None,
+    }
+    if not SOLANA_TRACKER_API_KEY:
+        return result
+    headers = {"x-api-key": SOLANA_TRACKER_API_KEY}
+    try:
+        token_data, holders_data = await asyncio.gather(
+            get_json(session, f"https://data.solanatracker.io/tokens/{contract}", headers=headers),
+            get_json(session, f"https://data.solanatracker.io/tokens/{contract}/holders/top", headers=headers),
+        )
+        risk = token_data.get("risk") if isinstance(token_data, dict) else {}
+        risk = risk if isinstance(risk, dict) else {}
+        factors = risk.get("risks") if isinstance(risk.get("risks"), list) else []
+        result["risk_score"] = risk.get("score")
+        result["rugged"] = bool(risk.get("rugged"))
+        result["risk_flags"] = [
+            str(item.get("name"))[:80]
+            for item in factors
+            if isinstance(item, dict) and item.get("name") and str(item.get("level", "")).lower() in {"danger", "warn", "warning"}
+        ][:5]
+        holders = holders_data
+        if isinstance(holders_data, dict):
+            holders = holders_data.get("accounts") or holders_data.get("data") or []
+            result["holder_count"] = holders_data.get("total")
+        if isinstance(holders, list):
+            percentages = []
+            for holder in holders[:10]:
+                if isinstance(holder, dict):
+                    try:
+                        percentages.append(float(holder.get("percentage") or 0))
+                    except (TypeError, ValueError):
+                        pass
+            if percentages:
+                result["top10_pct"] = sum(percentages)
+        result["status"] = "active"
+        _source_health["Solana Tracker"] = "active"
+    except Exception as exc:
+        log.warning("Solana Tracker enrichment failed for %s: %s", contract, exc)
+        result["status"] = "temporarily unavailable"
+        _source_health["Solana Tracker"] = "temporarily unavailable"
+        await notify_source_failure("Solana Tracker", str(exc))
+    return result
+
+
+async def x_social_enrichment(session: aiohttp.ClientSession, symbol: str, contract: str) -> dict:
+    result = {
+        "status": "not configured",
+        "mentions": None,
+        "unique_authors": None,
+        "engagement": None,
+        "momentum": "Unavailable",
+    }
+    if not X_BEARER_TOKEN:
+        return result
+    clean_symbol = re.sub(r"[^A-Za-z0-9_]", "", symbol)[:20]
+    terms = [f'"{contract}"']
+    if clean_symbol:
+        terms.append(f'"${clean_symbol}"')
+    query = f"({' OR '.join(terms)}) -is:retweet"
+    params = {
+        "query": query,
+        "max_results": "25",
+        "tweet.fields": "created_at,public_metrics,author_id,possibly_sensitive",
+    }
+    try:
+        data = await get_json(
+            session,
+            "https://api.x.com/2/tweets/search/recent",
+            headers={"Authorization": f"Bearer {X_BEARER_TOKEN}"},
+            params=params,
+        )
+        posts = data.get("data") if isinstance(data, dict) else []
+        posts = posts if isinstance(posts, list) else []
+        authors = {str(post.get("author_id")) for post in posts if isinstance(post, dict) and post.get("author_id")}
+        engagement = 0
+        for post in posts:
+            metrics = post.get("public_metrics") if isinstance(post, dict) else {}
+            if isinstance(metrics, dict):
+                engagement += sum(int(metrics.get(key) or 0) for key in ("like_count", "reply_count", "repost_count", "quote_count"))
+        mentions = len(posts)
+        if mentions >= 20 and engagement >= 100:
+            momentum = "🔥 Very Hot"
+        elif mentions >= 10 or engagement >= 40:
+            momentum = "📈 Rising"
+        elif mentions:
+            momentum = "➖ Limited / Neutral"
+        else:
+            momentum = "➖ No recent matching posts"
+        result.update(status="active", mentions=mentions, unique_authors=len(authors), engagement=engagement, momentum=momentum)
+        _source_health["X/Twitter"] = "active"
+    except Exception as exc:
+        log.warning("X enrichment failed for %s: %s", contract, exc)
+        result["status"] = "temporarily unavailable"
+        _source_health["X/Twitter"] = "temporarily unavailable"
+        await notify_source_failure("X/Twitter", str(exc))
+    return result
+
+
+async def enrich_candidate(contract: str, symbol: str) -> tuple[dict, dict]:
+    timeout = aiohttp.ClientTimeout(total=20)
+    async with aiohttp.ClientSession(timeout=timeout, headers={"User-Agent": "YRD-Alpha-Scout/1.1"}) as session:
+        return await asyncio.gather(
+            solana_tracker_enrichment(session, contract),
+            x_social_enrichment(session, symbol, contract),
+        )
+
+
 async def publish_live_candidate(pair: dict, engine: str, score: int):
     base = pair.get("baseToken") or {}
     contract = str(base.get("address") or "").strip()
@@ -394,6 +543,7 @@ async def publish_live_candidate(pair: dict, engine: str, score: int):
     if not all((alpha, waiting, review)):
         return False
     symbol = str(base.get("symbol") or "UNKNOWN").upper()[:20]
+    solana_data, x_data = await enrich_candidate(contract, symbol)
     liquidity = float(((pair.get("liquidity") or {}).get("usd")) or 0)
     market_cap = float(pair.get("marketCap") or pair.get("fdv") or 0)
     volume_h24 = float(((pair.get("volume") or {}).get("h24")) or 0)
@@ -402,14 +552,37 @@ async def publish_live_candidate(pair: dict, engine: str, score: int):
     created_ms = pair.get("pairCreatedAt")
     age_minutes = max(0, int((datetime.now(timezone.utc).timestamp() * 1000 - created_ms) / 60000)) if isinstance(created_ms, (int, float)) else None
     confidence = "HIGH" if score >= 85 else "MEDIUM"
-    risk = "HIGH" if liquidity < 100_000 or sells > buys * 1.4 else "MEDIUM"
+    tracker_score = solana_data.get("risk_score")
+    if solana_data.get("rugged"):
+        risk = "EXTREME — RUG FLAG"
+    elif isinstance(tracker_score, (int, float)) and tracker_score >= 9:
+        risk = "EXTREME"
+    elif isinstance(tracker_score, (int, float)) and tracker_score >= 7:
+        risk = "HIGH"
+    else:
+        risk = "HIGH" if liquidity < 100_000 or sells > buys * 1.4 else "MEDIUM"
+    tracker_risk = f"{tracker_score}/10" if isinstance(tracker_score, (int, float)) else "Unavailable"
+    risk_flags = solana_data.get("risk_flags") or []
+    flags_text = ", ".join(risk_flags) if risk_flags else ("None reported" if solana_data.get("status") == "active" else "Unavailable")
+    top10 = solana_data.get("top10_pct")
+    top10_text = f"{top10:.1f}%" if isinstance(top10, (int, float)) else "Unavailable"
+    holder_count = solana_data.get("holder_count")
+    holder_text = f"{int(holder_count):,}" if isinstance(holder_count, (int, float)) else "Unavailable"
+    x_mentions = x_data.get("mentions")
+    x_mentions_text = f"{x_mentions} recent posts" if isinstance(x_mentions, int) else "Unavailable"
+    x_engagement = x_data.get("engagement")
+    x_engagement_text = f"{x_engagement:,}" if isinstance(x_engagement, int) else "Unavailable"
+    coverage = (
+        f"DEX Screener: active | Solana Tracker: {solana_data.get('status')} | "
+        f"X/Twitter: {x_data.get('status')}"
+    )
     embed = discord.Embed(
         title=f"🔎 YRD ALPHA SCOUT — POSSIBLE SETUP: ${symbol}",
         description=(
             f"**Engine:** {engine}\n"
             "DEX market activity passed the current screening threshold.\n\n"
             "⚠️ **Yurman has NOT reviewed this setup yet.**\n"
-            "Wallet clustering, holder concentration, contract permissions, and X sentiment are not yet connected. Investigate before acting."
+            "On-chain and social signals are screening evidence, not instructions to buy. Investigate before acting."
         ),
         color=discord.Color.gold(),
         timestamp=datetime.now(timezone.utc),
@@ -420,7 +593,11 @@ async def publish_live_candidate(pair: dict, engine: str, score: int):
         ("Age", f"{age_minutes} minutes" if age_minutes is not None else "Unavailable", True),
         ("Buyers / Sellers", f"{buys} / {sells} (1h)", True), ("Risk", risk, True),
         ("Confidence", confidence, True), ("Signal Score", f"{score}/100", True),
-        ("Contract", contract, False), ("Source Coverage", "DEX Screener official public API. Contract, wallet, and X checks unavailable.", False),
+        ("Solana Risk Score", tracker_risk, True), ("Top-10 Holders", top10_text, True),
+        ("Holder Count", holder_text, True), ("Safety Flags", flags_text[:1024], False),
+        ("X Mentions", x_mentions_text, True), ("X Engagement", x_engagement_text, True),
+        ("Social Momentum", str(x_data.get("momentum") or "Unavailable"), True),
+        ("Contract", contract, False), ("Source Coverage", coverage[:1024], False),
     ]:
         embed.add_field(name=name, value=value, inline=inline)
     url = pair.get("url")
@@ -592,7 +769,9 @@ async def post_startup_notice_once():
             f"Connected: `{utc_now_text()}`\n"
             "Phase 2 review workflow: **active**.\n"
             "DEX Screener public scanner: **active**.\n"
-            "Wallet, contract, Axiom, FOMO, Trenchers, and X providers: **not connected yet**.",
+            f"Solana Tracker: **{_source_health['Solana Tracker']}**.\n"
+            f"X/Twitter: **{_source_health['X/Twitter']}**.\n"
+            "Axiom, FOMO, Robinhood, and Trenchers: **awaiting authorized API access**.",
             allowed_mentions=discord.AllowedMentions.none(),
         )
         _startup_notice_sent = True
@@ -632,8 +811,11 @@ async def status(interaction: discord.Interaction):
         "🟢 **YRD Alpha Scout is online**\n"
         f"Latency: `{round(client.latency * 1000)} ms`\n"
         f"Uptime: `{hours}h {minutes}m {secs}s`\n"
-        "Review workflow: `active`\nDEX scanner: `active`\n"
-        "Contract/wallet/X coverage: `not connected`",
+        "Review workflow: `active`\n"
+        f"DEX Screener: `{_source_health['DEX Screener']}`\n"
+        f"Solana Tracker: `{_source_health['Solana Tracker']}`\n"
+        f"X/Twitter: `{_source_health['X/Twitter']}`\n"
+        "Axiom/FOMO/Robinhood/Trenchers: `awaiting authorized API access`",
         ephemeral=True,
     )
 
