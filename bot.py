@@ -27,6 +27,15 @@ _startup_notice_sent = False
 
 DISCLAIMER = "Research only. Not financial advice or a guaranteed return. Meme coins can lose their entire value."
 REVIEW_ROLES = {"Yurman / Owner", "Admin"}
+ALERT_ROLES = [
+    ("🚀 New Launches", "New Launches", discord.ButtonStyle.primary),
+    ("✅ Yurman Reviewed", "Yurman Reviewed", discord.ButtonStyle.success),
+    ("🚨 Rug Warnings", "Rug Warnings", discord.ButtonStyle.danger),
+    ("🐋 Whale Activity", "Whale Activity", discord.ButtonStyle.primary),
+    ("📰 Market News", "Market News", discord.ButtonStyle.secondary),
+    ("🚨 Emergency Alerts", "Emergency Alerts", discord.ButtonStyle.danger),
+    ("💎 Premium Alerts", "Premium Alerts", discord.ButtonStyle.success),
+]
 
 
 def utc_now_text() -> str:
@@ -54,6 +63,140 @@ async def find_text_channel(name: str):
     except discord.DiscordException:
         log.exception("Could not fetch guild channels")
         return None
+
+
+async def get_or_create_role(guild: discord.Guild, name: str):
+    role = discord.utils.get(guild.roles, name=name)
+    if role is not None:
+        return role
+    return await guild.create_role(name=name, reason="YRD Alpha onboarding setup")
+
+
+class AlertPreferencesView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        for index, (label, role_name, style) in enumerate(ALERT_ROLES):
+            button = discord.ui.Button(label=label, style=style, custom_id=f"alerts:toggle:{role_name}", row=0 if index < 4 else 1)
+            button.callback = self._callback_for(role_name)
+            self.add_item(button)
+
+    def _callback_for(self, role_name: str):
+        async def callback(interaction: discord.Interaction):
+            if not interaction.guild or not isinstance(interaction.user, discord.Member):
+                await interaction.response.send_message("Use this button inside YRD Alpha.", ephemeral=True)
+                return
+            role = discord.utils.get(interaction.guild.roles, name=role_name)
+            if role is None:
+                await interaction.response.send_message("That alert role has not been configured yet.", ephemeral=True)
+                return
+            try:
+                if role in interaction.user.roles:
+                    await interaction.user.remove_roles(role, reason="Member disabled YRD Alpha alert preference")
+                    await interaction.response.send_message(f"Disabled **{role_name}** notifications.", ephemeral=True)
+                else:
+                    if role_name == "Premium Alerts" and not any(r.name == "YRD Alpha Premium" for r in interaction.user.roles):
+                        await interaction.response.send_message("Premium Alerts require the YRD Alpha Premium role.", ephemeral=True)
+                        return
+                    await interaction.user.add_roles(role, reason="Member enabled YRD Alpha alert preference")
+                    await interaction.response.send_message(f"Enabled **{role_name}** notifications.", ephemeral=True)
+            except discord.Forbidden:
+                await interaction.response.send_message("I cannot manage that role. Move the bot role above the alert roles.", ephemeral=True)
+        return callback
+
+
+class OnboardingSessionView(discord.ui.View):
+    def __init__(self, member_id: int):
+        super().__init__(timeout=300)
+        self.member_id = member_id
+        self.rules_accepted = False
+        self.risk_accepted = False
+        self.language = None
+
+    async def check_member(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.member_id:
+            await interaction.response.send_message("This private onboarding session belongs to another member.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Accept Rules", style=discord.ButtonStyle.success)
+    async def accept_rules(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self.check_member(interaction):
+            return
+        self.rules_accepted = True
+        button.disabled = True
+        button.label = "Rules Accepted"
+        await interaction.response.edit_message(view=self)
+
+    @discord.ui.button(label="Accept Risk Disclosure", style=discord.ButtonStyle.danger)
+    async def accept_risk(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self.check_member(interaction):
+            return
+        self.risk_accepted = True
+        button.disabled = True
+        button.label = "Risk Accepted"
+        await interaction.response.edit_message(view=self)
+
+    @discord.ui.button(label="English", style=discord.ButtonStyle.primary, row=1)
+    async def english(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self.check_member(interaction):
+            return
+        self.language = "English"
+        await interaction.response.send_message("Language selected: English.", ephemeral=True)
+
+    @discord.ui.button(label="Español", style=discord.ButtonStyle.primary, row=1)
+    async def spanish(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self.check_member(interaction):
+            return
+        self.language = "Español"
+        await interaction.response.send_message("Idioma seleccionado: Español.", ephemeral=True)
+
+    @discord.ui.button(label="Finish Onboarding", style=discord.ButtonStyle.success, row=2)
+    async def finish(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self.check_member(interaction):
+            return
+        missing = []
+        if not self.rules_accepted:
+            missing.append("accept the rules")
+        if not self.risk_accepted:
+            missing.append("accept the risk disclosure")
+        if not self.language:
+            missing.append("choose a language")
+        if missing:
+            await interaction.response.send_message("Before finishing, " + ", ".join(missing) + ".", ephemeral=True)
+            return
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("Onboarding must be completed inside the server.", ephemeral=True)
+            return
+        verified = discord.utils.get(interaction.guild.roles, name="Verified Member")
+        free = discord.utils.get(interaction.guild.roles, name="Free Member")
+        language_role = discord.utils.get(interaction.guild.roles, name=self.language)
+        roles = [role for role in (verified, free, language_role) if role]
+        try:
+            await interaction.user.add_roles(*roles, reason="Completed YRD Alpha Gatekeeper onboarding")
+        except discord.Forbidden:
+            await interaction.response.send_message("I cannot assign member roles. Move the bot role above Verified Member and Free Member.", ephemeral=True)
+            return
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(
+            content=f"✅ Onboarding complete in **{self.language}**. You now have Free Member access. Choose notification roles in #choose-your-alerts.",
+            view=self,
+        )
+
+
+class VerificationEntryView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Begin Verification", style=discord.ButtonStyle.success, custom_id="gatekeeper:begin")
+    async def begin(self, interaction: discord.Interaction, button: discord.ui.Button):
+        text = (
+            "**YRD Alpha Gatekeeper**\n"
+            "1. Read #rules.\n2. Read #risk-disclaimer.\n"
+            "3. Accept both below.\n4. Choose English or Español.\n5. Finish onboarding.\n\n"
+            "YRD Alpha staff will never DM asking for a seed phrase, private key, or wallet connection."
+        )
+        await interaction.response.send_message(text, view=OnboardingSessionView(interaction.user.id), ephemeral=True)
 
 
 def field_value(embed: discord.Embed, name: str, default: str = "Unknown") -> str:
@@ -287,6 +430,8 @@ async def on_ready():
         log.error("Bot is not connected to guild %s", GUILD_ID)
         return
     client.add_view(ReviewView())
+    client.add_view(VerificationEntryView())
+    client.add_view(AlertPreferencesView())
     try:
         synced = await tree.sync(guild=GUILD)
         log.info("Synced %d slash command(s) to %s", len(synced), guild.name)
@@ -533,6 +678,54 @@ async def emergency_alert(interaction: discord.Interaction, alert_type: str, tok
     embed.set_footer(text=DISCLAIMER)
     await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
     await interaction.response.send_message(f"Alert posted in #{target_map[alert_type]}.", ephemeral=True)
+
+
+@tree.command(name="setup_onboarding", description="Install Gatekeeper and alert-preference panels.", guild=GUILD)
+async def setup_onboarding(interaction: discord.Interaction):
+    if not is_reviewer(interaction):
+        await interaction.response.send_message("Only Yurman or an Admin can install onboarding.", ephemeral=True)
+        return
+    if not interaction.guild:
+        await interaction.response.send_message("Run this command inside YRD Alpha.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        for role_name in ["English", "Español"] + [role_name for _, role_name, _ in ALERT_ROLES]:
+            await get_or_create_role(interaction.guild, role_name)
+    except discord.Forbidden:
+        await interaction.followup.send("I cannot create roles. Give the bot Manage Roles permission and keep its role near the top.", ephemeral=True)
+        return
+
+    verification = await find_text_channel("verification")
+    alerts = await find_text_channel("choose-your-alerts")
+    if verification is None or alerts is None:
+        await interaction.followup.send("I need both #verification and #choose-your-alerts.", ephemeral=True)
+        return
+
+    gate = discord.Embed(
+        title="🛡️ YRD ALPHA GATEKEEPER",
+        description=(
+            "Complete verification before entering the member areas.\n\n"
+            "• Accept the server rules\n• Accept the meme-coin risk disclosure\n"
+            "• Choose English or Español\n• Receive Verified Member and Free Member access\n\n"
+            "**Staff will never DM asking for your seed phrase, private key, payment, or wallet connection.**"
+        ),
+        color=discord.Color.green(),
+    )
+    gate.set_footer(text="Never share wallet secrets with anyone—including staff.")
+    await verification.send(embed=gate, view=VerificationEntryView(), allowed_mentions=discord.AllowedMentions.none())
+
+    choices = discord.Embed(
+        title="🔔 CHOOSE YOUR YRD ALPHA ALERTS",
+        description=(
+            "Use the buttons to turn notification roles on or off.\n"
+            "Premium Alerts require the YRD Alpha Premium role.\n\n"
+            "Alerts report observed activity and risk; they are never guaranteed-profit instructions."
+        ),
+        color=discord.Color.blue(),
+    )
+    await alerts.send(embed=choices, view=AlertPreferencesView(), allowed_mentions=discord.AllowedMentions.none())
+    await interaction.followup.send("Gatekeeper and alert preferences installed.", ephemeral=True)
 
 
 async def main():
