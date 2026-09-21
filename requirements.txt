@@ -1,1 +1,1 @@
-discord.py>=2.4,<3
+discord.py>=2.4,<3\naiohttp>=3.10,<4\n
